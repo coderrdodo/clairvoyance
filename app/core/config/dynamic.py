@@ -119,6 +119,16 @@ async def BB_RECONCILE_BACKLOG_LIMIT() -> int:
     return await get_config("BB_RECONCILE_BACKLOG_LIMIT", 1000, int)
 
 
+async def BB_DAILY_BOT_ZYGOTE() -> bool:
+    """Fork Daily voice bots from a pre-imported zygote (default: False).
+
+    Skips the ~3.5 CPU-seconds of imports a spawned bot pays; measured 27.8s
+    -> 0.09s at 0.25 cores. Requires start_zygote() at boot (run.py). Falls
+    back to spawning whenever the zygote is absent or unhealthy.
+    """
+    return await get_config("BB_DAILY_BOT_ZYGOTE", False, bool)
+
+
 async def BB_DAILY_BOT_SUBPROCESS() -> bool:
     """Run each Daily voice bot in its own OS subprocess (default: True).
 
