@@ -64,7 +64,10 @@ class STTProvider(str, Enum):
     ELEVENLABS = "elevenlabs"
     ASSEMBLYAI = "assemblyai"
     SMALLEST = "smallest"
-    PHONON = "phonon"  # Phonon, our self-hosted STT server
+    # Phonon, our self-hosted STT server. No per-template block: its address
+    # and key are the deployment's (PHONON_STT_URL / PHONON_STT_API_KEY),
+    # never a template's, and it needs turn_detection='smart_turn'.
+    PHONON = "phonon"
 
 
 class SonioxSTTConfig(BaseModel):
@@ -354,27 +357,6 @@ class SmallestSTTConfig(BaseModel):
                 f"{', '.join(sorted(SMALLEST_LANGUAGES))}"
             )
         return value
-
-
-class PhononSTTConfig(BaseModel):
-    """Phonon, our self-hosted STT server.
-
-    Phonon only transcribes; turn-taking stays with the pipeline's VAD / turn
-    detection, so it takes no ``stt_configuration.end_of_speech_ms`` and needs
-    ``turn_detection='smart_turn'``. Its address and key are the deployment's
-    (PHONON_STT_URL / PHONON_STT_API_KEY), never a template's: a template
-    choosing the address would choose who receives the key.
-    """
-
-    fallback: Literal["sarvam", "none"] = Field(
-        "none",
-        description="STT for the rest of the call when Phonon cannot serve it "
-        "(connect refused, a non-retryable close, retries spent). Opt-in: "
-        "'none' (the default) fails the call's STT instead; 'sarvam' switches "
-        "to Sarvam on the environment's Sarvam key, with this template's "
-        "sarvam block (model, language, ...) except its silence window "
-        "(negative_frames_*), which applies only to provider='sarvam'.",
-    )
 
 
 class ElevenLabsSTTConfig(BaseModel):
@@ -754,7 +736,6 @@ class STTConfiguration(BaseModel):
     elevenlabs: Optional[ElevenLabsSTTConfig] = None
     assemblyai: Optional[AssemblyAISTTConfig] = None
     smallest: Optional[SmallestSTTConfig] = None
-    phonon: Optional[PhononSTTConfig] = None
 
     # SmartTurn ML config — only used when turn_detection='smart_turn'
     smart_turn: Optional[SmartTurnConfig] = None

@@ -8,7 +8,7 @@ the Pydantic models — no env/dynamic config needed (except API keys).
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Optional
+from typing import Optional
 
 from pipecat.services.elevenlabs.stt import CommitStrategy
 from pipecat.transcriptions.language import Language
@@ -22,8 +22,6 @@ from app.ai.voice.agents.breeze_buddy.template.types import (
     AssemblyAISTTConfig,
     DeepgramSTTConfig,
     ElevenLabsSTTConfig,
-    PhononSTTConfig,
-    SarvamSTTConfig,
     SmallestSTTConfig,
     SonioxSTTConfig,
     STTConfiguration,
@@ -55,7 +53,6 @@ from app.ai.voice.stt.assemblyai import u3_pro_wire_name
 from app.ai.voice.stt.elevenlabs import (
     resolve_languages as resolve_elevenlabs_languages,
 )
-from app.ai.voice.stt.sarvam import SarvamSTTServiceWithInterruptionPolicy
 from app.core.config.dynamic import (
     BB_SARVAM_STT_FINALIZE_ON_SEGMENT,
     BB_SARVAM_STT_HIGH_VAD_SENSITIVITY,
@@ -136,51 +133,6 @@ def _phonon_language(language: str | list[str] | None) -> str | None:
     auto-detects rather than pinning the first."""
     codes = _language_list(language)
     return codes[0] if len(codes) == 1 else None
-
-
-async def _phonon_fallback(
-    config: STTConfiguration,
-    accounts: Optional[Accounts],
-    stt_self_interrupt: bool,
-) -> Optional[SarvamSTTServiceWithInterruptionPolicy]:
-    """Sarvam, built from this template's sarvam block (on the environment's
-    Sarvam key; a provider='phonon' block names no Sarvam account), held
-    unconnected until Phonon gives up.
-
-    Fails open: if Sarvam cannot be built (no key, bad config) the call still
-    starts on Phonon, without a fallback.
-    """
-    update: dict[str, Any] = {
-        "provider": STTProvider.SARVAM,
-        "phonon": None,
-        # The env Sarvam key: a provider='phonon' block names no Sarvam account.
-        "credential_id": None,
-    }
-    # The template's one language, unless its sarvam block names its own: an
-    # unpinned Sarvam drifts into other scripts mid-call.
-    language = _phonon_language(config.language)
-    sv = config.sarvam
-    if language and not (sv and sv.language_code):
-        code = language if "-" in language else f"{language}-IN"
-        update["sarvam"] = (sv or SarvamSTTConfig()).model_copy(
-            update={"language_code": code}
-        )
-    sarvam_config = config.model_copy(update=update)
-    try:
-        fallback = await create_stt_from_config(
-            sarvam_config, accounts=accounts, stt_self_interrupt=stt_self_interrupt
-        )
-    except Exception as e:
-        logger.warning(
-            f"Phonon STT: Sarvam fallback unavailable ({type(e).__name__}: {e}); "
-            "continuing without one"
-        )
-        return None
-    if not isinstance(fallback, SarvamSTTServiceWithInterruptionPolicy):
-        logger.warning("Phonon STT: Sarvam fallback not built; continuing without")
-        return None
-    fallback.hold_connection_until_active()
-    return fallback
 
 
 async def create_stt_from_config(
@@ -512,19 +464,12 @@ async def create_stt_from_config(
     if config.provider == STTProvider.PHONON:
         # Phonon, our self-hosted server: its address and key are the
         # deployment's, never a template's.
-        nm = config.phonon or PhononSTTConfig()
-        fallback = (
-            await _phonon_fallback(config, accounts, stt_self_interrupt)
-            if nm.fallback == "sarvam"
-            else None
-        )
         return build_phonon_stt(
             PhononConfig(
                 url=PHONON_STT_URL,
                 api_key=PHONON_STT_API_KEY or "",
                 language=_phonon_language(config.language),
-            ),
-            fallback=fallback,
+            )
         )
 
     # Default: Google

@@ -22,9 +22,8 @@ utterance, so a final maps to one TranscriptionFrame with no merging here.
 Close codes (reason is ``"<code>: <message>"``) decide what happens next, see
 :func:`resume_delay`: draining/server errors/overload reconnect with
 ``resume=true`` and replay the unfinished turn; anything else, or a retry
-budget spent, gives up. Giving up pushes one ErrorFrame carrying
-:class:`PhononUnavailable`: behind :class:`PhononWithFallback` that moves
-the rest of the call to the fallback STT (Sarvam); without one it is fatal.
+budget spent, gives up. Giving up pushes one fatal ErrorFrame carrying
+:class:`PhononUnavailable`: the call's STT has failed.
 
 Turn-taking stays Clairvoyance's job (pipeline VAD / turn detection); Phonon
 only transcribes.
@@ -45,20 +44,15 @@ from uuid import uuid4
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
-    ErrorFrame,
     Frame,
     InterimTranscriptionFrame,
     StartFrame,
     TranscriptionFrame,
     VADUserStoppedSpeakingFrame,
 )
-from pipecat.pipeline.service_switcher import (
-    ServiceSwitcher,
-    ServiceSwitcherStrategyFailover,
-)
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.settings import STTSettings
-from pipecat.services.stt_service import STTService, WebsocketSTTService
+from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.utils.time import time_now_iso8601
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
@@ -70,7 +64,6 @@ __all__ = [
     "PhononConfig",
     "PhononSTTService",
     "PhononUnavailable",
-    "PhononWithFallback",
     "build_phonon_stt",
     "resume_delay",
 ]
@@ -82,7 +75,7 @@ _CLOSE_STREAM = json.dumps({"type": "CloseStream"})
 
 # Replay after a reconnect covers at most this much of the unfinished turn.
 REPLAY_MAX_SECONDS = 30.0
-# A slow upgrade is a failed one: the fallback is better than a long gap.
+# A slow upgrade is a failed one: past this the caller is unheard too long.
 _OPEN_TIMEOUT_SECS = 5.0
 # How long stop() waits for Phonon's owed finals after CloseStream (Phonon
 # itself waits up to 5 s for them).
@@ -107,7 +100,7 @@ _RESUME_BUDGET: dict[int, tuple[float, ...]] = {
 }
 _HEALTHY_RESET_SECS = 60.0
 # One close's resume attempts, back-offs and connect timeouts together, end
-# within this: past it the caller has been unheard too long, so fall back.
+# within this: past it the caller has been unheard too long, so give up.
 _RESUME_MAX_SECS = 10.0
 # The call's first connect: one more try after each of these for a server
 # that is restarting (refused, HTTP 502/503/504). A rejected key or a
@@ -171,7 +164,7 @@ def _reason_code(reason: str) -> str:
 
 
 class PhononUnavailable(Exception):
-    """Phonon cannot serve the rest of this call (the fallback trigger)."""
+    """Phonon cannot serve the rest of this call."""
 
 
 @dataclass
@@ -209,7 +202,6 @@ class PhononSTTService(WebsocketSTTService):
         api_key: str = "",
         language: Optional[str] = None,
         call_id: Optional[str] = None,
-        fatal_on_failure: bool = True,
         **kwargs: Any,
     ):
         # keepalive_timeout: after this long without audio, Pipecat calls
@@ -225,8 +217,6 @@ class PhononSTTService(WebsocketSTTService):
         # Resume needs the same call_id on every connection of this call; a
         # caller that names none gets a generated one.
         self._call_id = safe_call_id(call_id)
-        # No fallback behind us: giving up must fail the call, not go silent.
-        self._fatal_on_failure = fatal_on_failure
         self._receive_task = None
         # Audio of the current unfinished turn (since the last final), as
         # (seq, chunk), bounded to REPLAY_MAX_SECONDS; replayed on resume.
@@ -535,8 +525,7 @@ class PhononSTTService(WebsocketSTTService):
             return
         self._failed = True
         self._turn_finished()
-        target = "the call fails" if self._fatal_on_failure else "using the fallback"
-        message = f"Phonon STT unavailable ({reason}); {target}"
+        message = f"Phonon STT unavailable ({reason}); the call fails"
         logger.warning(f"{self}: {message}")
         ws, self._websocket = self._websocket, None
         if ws is not None:
@@ -547,7 +536,7 @@ class PhononSTTService(WebsocketSTTService):
         try:
             raise PhononUnavailable(message)
         except PhononUnavailable as e:
-            await self.push_error(message, exception=e, fatal=self._fatal_on_failure)
+            await self.push_error(message, exception=e, fatal=True)
 
     # ---- results -------------------------------------------------------------------
 
@@ -616,68 +605,12 @@ class PhononSTTService(WebsocketSTTService):
             )
 
 
-class _FailoverOnceFromPhonon(ServiceSwitcherStrategyFailover):
-    """Pipecat's failover, one way: only Phonon giving up moves the call.
-
-    Stock failover switches on any non-fatal error and cycles back, so a
-    Sarvam hiccup would hand the call back to a dead Phonon.
-    """
-
-    async def handle_error(self, error: ErrorFrame) -> FrameProcessor | None:
-        if self.active_service is not self.services[0]:
-            return None
-        if not isinstance(error.exception, PhononUnavailable):
-            return None
-        return await super().handle_error(error)
-
-
-class PhononWithFallback(ServiceSwitcher):
-    """Phonon first; when it gives up, the rest of the call goes to the fallback.
-
-    A stock Pipecat ServiceSwitcher: both services sit in the pipeline, only
-    the active one receives frames. The fallback should not hold a provider
-    session it may never use (Sarvam's ``hold_connection_until_active``).
-    """
-
-    def __init__(self, primary: PhononSTTService, fallback: STTService):
-        super().__init__(
-            services=[primary, fallback], strategy_type=_FailoverOnceFromPhonon
-        )
-
-        @self.strategy.event_handler("on_service_switched")
-        async def _on_switched(_strategy: Any, service: FrameProcessor) -> None:
-            logger.warning(f"Phonon STT fell back to {service}")
-
-    @property
-    def requires_vad_analyzer(self) -> bool:
-        """Phonon's, so the pipeline's no-VAD warning sees through the switcher."""
-        return True
-
-    def set_self_interrupt(self, enabled: bool) -> None:
-        """Forward a node-level interruption override to the services that
-        take one (Sarvam), so it holds after a fallback too."""
-        for service in self.services:
-            setter = getattr(service, "set_self_interrupt", None)
-            if setter is not None:
-                setter(enabled)
-
-
-def build_phonon_stt(
-    config: PhononConfig, fallback: Optional[STTService] = None
-) -> PhononSTTService | PhononWithFallback:
-    """Create a Phonon STT service pointed at Phonon, behind the fallback
-    when one is given."""
-    logger.info(
-        f"Using Phonon STT (at {config.url}, "
-        f"fallback={type(fallback).__name__ if fallback else 'none'}) for Breeze Buddy"
-    )
-    service = PhononSTTService(
+def build_phonon_stt(config: PhononConfig) -> PhononSTTService:
+    """Create a Phonon STT service pointed at Phonon."""
+    logger.info(f"Using Phonon STT (at {config.url}) for Breeze Buddy")
+    return PhononSTTService(
         url=config.url,
         api_key=config.api_key,
         language=config.language,
         call_id=config.call_id,
-        fatal_on_failure=fallback is None,
     )
-    if fallback is None:
-        return service
-    return PhononWithFallback(service, fallback)

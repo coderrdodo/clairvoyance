@@ -1,10 +1,10 @@
 """Phonon STT: Clairvoyance's client for Phonon (our self-hosted STT server).
 
-Locks in: the provider enum and routing (default URL, a template's own URL,
-the legacy env map, key, language, fallback), config validation, the connect
+Locks in: the provider enum and routing (the deployment's URL, never a
+template's; the legacy env map, key, language), config validation, the connect
 URL and auth header Phonon expects, how Phonon's Deepgram-style messages map
-to Pipecat frames and back, the close-code policy (resume with replay of the
-unfinished turn, or give up), and the Sarvam fallback taking the audio.
+to Pipecat frames and back, and the close-code policy (resume with replay of
+the unfinished turn, or give up: fatal for the call's STT).
 """
 
 from __future__ import annotations
@@ -17,19 +17,13 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from pipecat.frames.frames import (
     EndFrame,
-    ErrorFrame,
     Frame,
-    InputAudioRawFrame,
     InterimTranscriptionFrame,
-    ServiceSwitcherRequestMetadataFrame,
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.sarvam.stt import SarvamSTTService
-from pipecat.services.stt_service import STTService
-from pipecat.tests.utils import SleepFrame, run_test
 from pydantic import ValidationError
 from websockets.datastructures import Headers
 from websockets.exceptions import InvalidStatus
@@ -47,26 +41,19 @@ from app.ai.voice.stt import PhononConfig, PhononSTTService, build_phonon_stt
 from app.ai.voice.stt.phonon import (
     REPLAY_MAX_SECONDS,
     PhononUnavailable,
-    PhononWithFallback,
     resume_delay,
 )
-from app.ai.voice.stt.sarvam import SarvamConfig, build_sarvam_stt
 from app.core.config import static
 
 
 def _capture(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     seen: dict[str, Any] = {}
 
-    def fake(config: Any, fallback: Any = None) -> str:
+    def fake(config: Any) -> str:
         seen["config"] = config
-        seen["fallback"] = fallback
         return "svc"
 
-    async def fake_fallback(*_: Any) -> str:
-        return "sarvam-svc"
-
     monkeypatch.setattr(bb_stt_mod, "build_phonon_stt", fake)
-    monkeypatch.setattr(bb_stt_mod, "_phonon_fallback", fake_fallback)
     return seen
 
 
@@ -193,14 +180,14 @@ async def test_routes_to_the_default_phonon_url(monkeypatch):
 
 async def test_a_template_cannot_choose_where_the_key_goes(monkeypatch):
     # The deployment's key goes only to PHONON_STT_URL (review: key leak). A
-    # template's url is not a field: ignored, so it never fails a load either.
+    # template has no phonon block: one is ignored, so it never fails a load.
     seen = _capture(monkeypatch)
     config = STTConfiguration(
         provider="phonon",
         turn_detection="smart_turn",
         phonon={"url": "wss://attacker.example"},
     )
-    assert config.phonon is not None and not hasattr(config.phonon, "url")
+    assert not hasattr(config, "phonon")
     await create_stt_from_config(config)
     assert seen["config"].url == static.PHONON_STT_URL
 
@@ -215,8 +202,6 @@ def test_phonon_needs_smart_turn(mode):
 def test_phonon_asks_the_pipeline_for_a_vad():
     svc = build_phonon_stt(PhononConfig(url="ws://p"))
     assert svc.requires_vad_analyzer is True
-    switcher = build_phonon_stt(PhononConfig(url="ws://p"), fallback=_RecordingSTT())
-    assert switcher.requires_vad_analyzer is True
 
 
 async def test_legacy_env_map_does_not_route_to_phonon(monkeypatch):
@@ -344,7 +329,7 @@ async def test_messages_without_text_push_nothing(message):
     assert await _frames_for(message) == []
 
 
-# ---- template: key, language, fallback --------------------------------------------
+# ---- template: key, language ----------------------------------------------------
 
 
 async def test_the_key_comes_from_static_config_never_the_template(monkeypatch):
@@ -356,10 +341,10 @@ async def test_the_key_comes_from_static_config_never_the_template(monkeypatch):
     assert seen["config"].api_key == "k-123"
     assert "k-123" not in repr(seen["config"])  # never logged via the config
     # A key in a template is not a field: it is dropped, never used.
-    block = STTConfiguration(
+    config = STTConfiguration(
         provider="phonon", turn_detection="smart_turn", phonon={"api_key": "k"}
-    ).phonon
-    assert block is not None and not hasattr(block, "api_key")
+    )
+    assert "k" not in config.model_dump_json()
 
 
 @pytest.mark.parametrize(
@@ -374,86 +359,6 @@ async def test_the_templates_language_is_passed_as_is(monkeypatch, language, sen
         )
     )
     assert seen["config"].language == sent
-
-
-async def test_no_fallback_unless_the_template_selects_one(monkeypatch):
-    seen = _capture(monkeypatch)
-    await create_stt_from_config(
-        STTConfiguration(provider="phonon", turn_detection="smart_turn")
-    )
-    assert seen["fallback"] is None
-
-
-async def test_a_template_can_opt_into_the_sarvam_fallback(monkeypatch):
-    seen = _capture(monkeypatch)
-    await create_stt_from_config(
-        STTConfiguration(
-            provider="phonon",
-            turn_detection="smart_turn",
-            phonon={"fallback": "sarvam"},
-        )
-    )
-    assert seen["fallback"] == "sarvam-svc"
-
-
-async def test_fallback_none_builds_no_fallback(monkeypatch):
-    seen = _capture(monkeypatch)
-    await create_stt_from_config(
-        STTConfiguration(
-            provider="phonon", turn_detection="smart_turn", phonon={"fallback": "none"}
-        )
-    )
-    assert seen["fallback"] is None
-
-
-@pytest.mark.parametrize("fallback", ["deepgram", "", None, "Sarvam"])
-def test_unknown_fallbacks_are_refused_at_template_save(fallback):
-    with pytest.raises(ValidationError):
-        STTConfiguration(
-            provider="phonon",
-            turn_detection="smart_turn",
-            phonon={"fallback": fallback},
-        )
-
-
-async def test_the_sarvam_fallback_is_built_from_the_template_and_held(monkeypatch):
-    built: dict[str, Any] = {}
-    sarvam = _sarvam()
-
-    async def fake_create(config: Any, accounts: Any = None, **kwargs: Any) -> Any:
-        built["config"] = config
-        return sarvam
-
-    monkeypatch.setattr(bb_stt_mod, "create_stt_from_config", fake_create)
-    config = STTConfiguration(
-        provider="phonon",
-        turn_detection="smart_turn",
-        sarvam={"language_code": "hi-IN"},
-        language="hi",
-    )
-    assert await bb_stt_mod._phonon_fallback(config, None, True) is sarvam
-    assert built["config"].provider == STTProvider.SARVAM
-    assert built["config"].sarvam.language_code == "hi-IN"
-    assert sarvam._standby  # no Sarvam session until it is needed
-
-
-async def test_a_fallback_that_cannot_be_built_fails_open(monkeypatch):
-    async def broken(*_: Any, **__: Any) -> Any:
-        raise ValueError("SARVAM_API_KEY is required")
-
-    monkeypatch.setattr(bb_stt_mod, "create_stt_from_config", broken)
-    config = STTConfiguration(provider="phonon", turn_detection="smart_turn")
-    assert await bb_stt_mod._phonon_fallback(config, None, True) is None
-
-
-def test_builder_wraps_the_service_when_given_a_fallback():
-    fallback = _RecordingSTT()
-    wrapped = build_phonon_stt(PhononConfig(url="ws://p"), fallback=fallback)
-    assert isinstance(wrapped, PhononWithFallback)
-    primary = wrapped.services[0]
-    assert isinstance(primary, PhononSTTService) and not primary._fatal_on_failure
-    alone = build_phonon_stt(PhononConfig(url="ws://p"))
-    assert isinstance(alone, PhononSTTService) and alone._fatal_on_failure
 
 
 # ---- connect: auth header, language, call_id --------------------------------------
@@ -494,20 +399,12 @@ async def test_a_rejected_key_gives_up_at_once(monkeypatch):
     rejected = InvalidStatus(Response(401, "Unauthorized", Headers(), b""))
     connect = FakeConnect(rejected)
     monkeypatch.setattr(phonon_mod, "websocket_connect", connect)
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     errors = _errors(svc)
     await svc._connect_websocket()
     assert len(connect.calls) == 1 and svc.failed
     assert isinstance(errors[0]["exception"], PhononUnavailable)
-    assert not errors[0]["fatal"]
-
-
-async def test_without_a_fallback_giving_up_is_fatal(monkeypatch):
-    monkeypatch.setattr(phonon_mod, "websocket_connect", FakeConnect(OSError("x")))
-    svc = _service()  # fatal_on_failure defaults to True
-    errors = _errors(svc)
-    await svc._connect_websocket()
-    assert errors[0]["fatal"]
+    assert errors[0]["fatal"]  # no fallback: the call's STT has failed
 
 
 # ---- close codes ------------------------------------------------------------------
@@ -611,7 +508,7 @@ async def test_audio_during_the_outage_is_replayed_in_order(monkeypatch):
 async def test_1008_is_never_retried(monkeypatch):
     connect = FakeConnect(FakeSocket())
     monkeypatch.setattr(phonon_mod, "websocket_connect", connect)
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     errors = _errors(svc)
     assert not await svc._after_close(
         1008, "unsupported_language: language 'kn' is not served here"
@@ -630,7 +527,7 @@ async def test_1013_retries_once_after_a_pause_then_gives_up(monkeypatch):
     monkeypatch.setattr(phonon_mod, "_sleep", fake_sleep)
     connect = FakeConnect(FakeSocket(), FakeSocket())
     monkeypatch.setattr(phonon_mod, "websocket_connect", connect)
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     errors = _errors(svc)
     assert await svc._after_close(1013, "overloaded: busy")
     assert slept == [0.5] and len(connect.calls) == 1
@@ -641,7 +538,7 @@ async def test_1013_retries_once_after_a_pause_then_gives_up(monkeypatch):
 async def test_a_resume_that_never_connects_gives_up_after_its_budget(monkeypatch):
     connect = FakeConnect(*[OSError("refused")] * 4)
     monkeypatch.setattr(phonon_mod, "websocket_connect", connect)
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     errors = _errors(svc)
     assert not await svc._after_close(1001, "draining: restart")
     assert len(connect.calls) == 4  # every 1001 attempt was tried
@@ -658,7 +555,7 @@ async def test_receive_loop_resumes_twice_on_1011_then_gives_up(monkeypatch):
     third = FakeSocket(close_code=1011, close_reason="internal: boom")
     connect = FakeConnect(second, third)
     monkeypatch.setattr(phonon_mod, "websocket_connect", connect)
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     errors = _errors(svc)
     pushed: list[Frame] = []
 
@@ -677,7 +574,7 @@ async def test_receive_loop_resumes_twice_on_1011_then_gives_up(monkeypatch):
 async def test_a_requested_close_is_not_a_failure(monkeypatch):
     connect = FakeConnect()
     monkeypatch.setattr(phonon_mod, "websocket_connect", connect)
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     errors = _errors(svc)
     svc._websocket = FakeSocket(close_code=1000)
     svc._closing = True  # CloseStream was sent
@@ -687,122 +584,13 @@ async def test_a_requested_close_is_not_a_failure(monkeypatch):
 
 async def test_nothing_is_sent_after_giving_up(monkeypatch):
     monkeypatch.setattr(phonon_mod, "websocket_connect", FakeConnect(OSError("x")))
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     _errors(svc)
     await svc._connect_websocket()
     socket = FakeSocket()
     svc._websocket = socket
     await _feed(svc, b"\x01")
     assert socket.sent == [] and not svc._turn
-
-
-# ---- fallback ---------------------------------------------------------------------
-
-
-class _RecordingSTT(STTService):
-    """A fallback STT that records the audio it is asked to transcribe."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.audio: list[bytes] = []
-        self.activated = False
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        if isinstance(frame, ServiceSwitcherRequestMetadataFrame):
-            self.activated = True
-        await super().process_frame(frame, direction)
-
-    async def run_stt(self, audio: bytes):
-        self.audio.append(audio)
-        yield None
-
-
-def _audio(payload: bytes) -> InputAudioRawFrame:
-    return InputAudioRawFrame(audio=payload, sample_rate=16000, num_channels=1)
-
-
-async def test_audio_flows_to_the_fallback_once_phonon_gives_up(monkeypatch):
-    monkeypatch.setattr(
-        phonon_mod, "websocket_connect", FakeConnect(OSError("refused"))
-    )
-    fallback = _RecordingSTT()
-    switcher = build_phonon_stt(PhononConfig(url="ws://p"), fallback=fallback)
-    assert isinstance(switcher, PhononWithFallback)
-    _, up = await run_test(
-        switcher,
-        frames_to_send=[SleepFrame(0.1), _audio(b"\x01\x02"), _audio(b"\x03\x04")],
-    )
-    assert fallback.activated
-    assert fallback.audio == [b"\x01\x02", b"\x03\x04"]
-    # The give-up still reaches the pipeline (track_error via on_pipeline_error).
-    errors = [f for f in up if isinstance(f, ErrorFrame)]
-    assert errors and isinstance(errors[0].exception, PhononUnavailable)
-    assert not errors[0].fatal
-
-
-async def test_phonon_keeps_the_audio_while_it_is_healthy(monkeypatch):
-    sockets = FakeSocket()
-
-    async def stay_open(url: str, **kwargs: Any) -> FakeSocket:
-        return sockets
-
-    # A socket whose receive loop never ends on its own.
-    async def forever(self: Any) -> None:
-        await asyncio.Event().wait()
-
-    monkeypatch.setattr(phonon_mod, "websocket_connect", stay_open)
-    monkeypatch.setattr(PhononSTTService, "_receive_messages", forever)
-    monkeypatch.setattr(phonon_mod, "_CLOSE_STREAM_WAIT_SECS", 0.05)
-    fallback = _RecordingSTT()
-    switcher = build_phonon_stt(PhononConfig(url="ws://p"), fallback=fallback)
-    await run_test(switcher, frames_to_send=[SleepFrame(0.05), _audio(b"\x01\x02")])
-    assert b"\x01\x02" in sockets.sent and fallback.audio == []
-    assert not fallback.activated
-
-
-async def test_only_phonon_giving_up_moves_the_call():
-    fallback = _RecordingSTT()
-    switcher = build_phonon_stt(PhononConfig(url="ws://p"), fallback=fallback)
-    assert isinstance(switcher, PhononWithFallback)
-    primary = switcher.services[0]
-    other = ErrorFrame("send failed", processor=primary)
-    assert await switcher.strategy.handle_error(other) is None
-    assert switcher.strategy.active_service is primary
-
-
-def _sarvam() -> Any:
-    return build_sarvam_stt(
-        SarvamConfig(api_key="k", model="saarika:v2.5", sample_rate=8000)
-    )
-
-
-async def test_a_held_sarvam_connects_only_when_activated(monkeypatch):
-    connects: list[str] = []
-
-    async def record(self: Any) -> None:
-        connects.append("connect")
-
-    monkeypatch.setattr(SarvamSTTService, "_connect", record)
-    monkeypatch.setattr(
-        "pipecat.services.stt_service.STTService.process_frame", _no_parent
-    )
-    sarvam = _sarvam()
-    sarvam.hold_connection_until_active()
-    sarvam._sample_rate = 8000
-    await sarvam._connect()  # what start() does
-    assert connects == []
-    await sarvam.process_frame(
-        ServiceSwitcherRequestMetadataFrame(service=sarvam), FrameDirection.DOWNSTREAM
-    )
-    assert connects == ["connect"]
-
-
-async def test_set_self_interrupt_reaches_the_fallback():
-    sarvam = _sarvam()
-    switcher = build_phonon_stt(PhononConfig(url="ws://p"), fallback=sarvam)
-    assert isinstance(switcher, PhononWithFallback)
-    switcher.set_self_interrupt(False)
-    assert sarvam._self_interrupt is False
 
 
 # ---- replay keeps every chunk and every turn boundary ------------------------------
@@ -922,7 +710,7 @@ async def test_a_refused_connect_while_draining_tries_again(monkeypatch):
     resumed = FakeSocket()
     connect = FakeConnect(OSError("refused"), OSError("refused"), resumed)
     monkeypatch.setattr(phonon_mod, "websocket_connect", connect)
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     assert await svc._after_close(1001, "draining: restart")
     assert svc._websocket is resumed and not svc.failed
     assert len(connect.calls) == 3
@@ -936,19 +724,19 @@ async def test_http_503_on_resume_tries_again_but_401_gives_up(monkeypatch):
     resumed = FakeSocket()
     connect = FakeConnect(_http(503), resumed)
     monkeypatch.setattr(phonon_mod, "websocket_connect", connect)
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     assert await svc._after_close(1011, "server_error: model gone")
     assert svc._websocket is resumed
 
     connect = FakeConnect(_http(401), FakeSocket())
     monkeypatch.setattr(phonon_mod, "websocket_connect", connect)
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     assert not await svc._after_close(1011, "server_error: model gone")
     assert len(connect.calls) == 1 and svc.failed
 
 
 async def test_a_healthy_stretch_restores_the_retry_budget(monkeypatch):
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     svc._resumes_used = {1006: 2}  # both network-drop retries already spent
     svc._live_since = phonon_mod.time.monotonic() - 61  # healthy for 61 s
     monkeypatch.setattr(phonon_mod, "websocket_connect", FakeConnect(FakeSocket()))
@@ -957,7 +745,7 @@ async def test_a_healthy_stretch_restores_the_retry_budget(monkeypatch):
 
 
 async def test_without_a_healthy_stretch_the_budget_still_runs_out(monkeypatch):
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     _errors(svc)
     svc._resumes_used = {1006: 2}
     svc._live_since = phonon_mod.time.monotonic() - 5  # only 5 s since
@@ -1071,7 +859,7 @@ async def test_the_first_connect_retries_a_restarting_phonon(monkeypatch):
     live = FakeSocket()
     connect = FakeConnect(OSError("refused"), _http(503), live)
     monkeypatch.setattr(phonon_mod, "websocket_connect", connect)
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     await svc._connect_websocket()
     assert svc._websocket is live and not svc.failed
     assert slept == [0.5, 1.0] and len(connect.calls) == 3
@@ -1083,7 +871,7 @@ async def test_the_first_connect_does_not_retry_a_bad_key_or_a_timeout(
 ):
     connect = FakeConnect(error, FakeSocket())
     monkeypatch.setattr(phonon_mod, "websocket_connect", connect)
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     _errors(svc)
     await svc._connect_websocket()
     assert len(connect.calls) == 1 and svc.failed
@@ -1107,7 +895,7 @@ async def test_a_resume_ends_within_its_time_cap(monkeypatch):
         raise TimeoutError("slow")
 
     monkeypatch.setattr(phonon_mod, "websocket_connect", times_out)
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     errors = _errors(svc)
     start = clock[0]
     assert not await svc._after_close(1001, "draining: restart")
@@ -1115,7 +903,7 @@ async def test_a_resume_ends_within_its_time_cap(monkeypatch):
     assert svc.failed and "no resume within" in errors[0]["msg"]
 
 
-# ---- review round 4: sockets closed, buffer and marks in step, fallback -----
+# ---- review round 4: sockets closed, buffer and marks in step ----------------
 
 
 async def test_a_bad_message_closes_the_socket_before_resuming(monkeypatch):
@@ -1124,7 +912,7 @@ async def test_a_bad_message_closes_the_socket_before_resuming(monkeypatch):
     old = FakeSocket(messages=["[1, 2]"], close_code=None)  # not an object
     resumed = FakeSocket()
     monkeypatch.setattr(phonon_mod, "websocket_connect", FakeConnect(resumed))
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     _errors(svc)
     svc._websocket = old
     await asyncio.wait_for(svc._receive_task_handler(svc._report_error), 2)
@@ -1138,7 +926,7 @@ async def test_a_resumed_socket_whose_replay_fails_is_closed(monkeypatch):
 
     broken, resumed = BrokenSocket(), FakeSocket()
     monkeypatch.setattr(phonon_mod, "websocket_connect", FakeConnect(broken, resumed))
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     svc._remember(b"\x01\x02")
     assert await svc._after_close(1001, "draining: restart")
     assert broken.state is State.CLOSED and svc._websocket is resumed
@@ -1151,7 +939,7 @@ async def test_a_resume_cancelled_mid_replay_closes_its_socket(monkeypatch):
 
     slow = SlowSocket()
     monkeypatch.setattr(phonon_mod, "websocket_connect", FakeConnect(slow))
-    svc = _service(fatal_on_failure=False)
+    svc = _service()
     svc._remember(b"\x01\x02")
     task = asyncio.ensure_future(svc._after_close(1001, "draining: restart"))
     await asyncio.sleep(0.01)
@@ -1176,92 +964,3 @@ async def test_an_unasked_final_keeps_audio_after_a_pending_finalize():
     svc.stop_processing_metrics = no_op  # type: ignore[method-assign]
     await svc.handle_message(_results("cut", is_final=True, from_finalize=False))
     assert [chunk for _, chunk in svc._turn] == [b"A", b"B"]
-
-
-async def test_the_fallback_never_inherits_the_templates_account(monkeypatch):
-    built: dict[str, Any] = {}
-
-    async def fake_create(config: Any, accounts: Any = None, **kwargs: Any) -> Any:
-        built["config"] = config
-        return _sarvam()
-
-    monkeypatch.setattr(bb_stt_mod, "create_stt_from_config", fake_create)
-    config = STTConfiguration(
-        provider="phonon", turn_detection="smart_turn"
-    ).model_copy(update={"credential_id": "cred-phonon-row"})
-    await bb_stt_mod._phonon_fallback(config, None, True)
-    assert built["config"].credential_id is None  # the env Sarvam key
-
-
-async def test_a_held_sarvam_keeps_audio_until_its_socket_is_up():
-    sarvam = _sarvam()
-    sarvam.hold_connection_until_active()
-    sarvam._sample_rate = 8000
-    sent: list[str] = []
-
-    class Socket:
-        async def translate(self, **kwargs: Any) -> None:
-            sent.append(kwargs["audio"])
-
-        transcribe = translate
-
-    async for _ in sarvam.run_stt(b"\x01\x02"):  # connecting: kept
-        pass
-    async for _ in sarvam.run_stt(b"\x03\x04"):
-        pass
-    assert sent == [] and list(sarvam._held_audio) == [b"\x01\x02", b"\x03\x04"]
-    sarvam._socket_client = Socket()
-    async for _ in sarvam.run_stt(b"\x05\x06"):  # connected: held audio first
-        pass
-    # In order, the held audio first (base64 of each chunk).
-    assert sent == ["AQI=", "AwQ=", "BQY="] and not sarvam._held_audio
-
-
-# ---- review round 5: the fallback keeps the template's language; held once ----
-
-
-@pytest.mark.parametrize(
-    "language, sarvam, pinned",
-    [
-        ("hi-IN", None, "hi-IN"),
-        ("hi", None, "hi-IN"),
-        (["hi", "en"], None, None),  # mixed: Sarvam auto-detects
-        ("hi-IN", {"language_code": "en-IN"}, "en-IN"),  # its own block wins
-    ],
-)
-async def test_the_fallback_keeps_the_templates_language(
-    monkeypatch, language, sarvam, pinned
-):
-    built: dict[str, Any] = {}
-
-    async def fake_create(config: Any, accounts: Any = None, **kwargs: Any) -> Any:
-        built["config"] = config
-        return _sarvam()
-
-    monkeypatch.setattr(bb_stt_mod, "create_stt_from_config", fake_create)
-    config = STTConfiguration(
-        provider="phonon", turn_detection="smart_turn", language=language, sarvam=sarvam
-    )
-    await bb_stt_mod._phonon_fallback(config, None, True)
-    block = built["config"].sarvam
-    assert (block.language_code if block else None) == pinned
-
-
-async def test_a_held_sarvam_holds_only_until_its_first_connect():
-    sarvam = _sarvam()
-    sarvam.hold_connection_until_active()
-    sarvam._sample_rate = 8000
-
-    class Socket:
-        async def translate(self, **kwargs: Any) -> None:
-            return None
-
-        transcribe = translate
-
-    sarvam._socket_client = Socket()
-    async for _ in sarvam.run_stt(b"\x01\x02"):
-        pass
-    sarvam._socket_client = None  # a later reconnect: as for any Sarvam call
-    async for _ in sarvam.run_stt(b"\x03\x04"):
-        pass
-    assert not sarvam._held_audio
